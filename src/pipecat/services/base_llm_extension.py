@@ -46,8 +46,33 @@ class BaseLLMExtension(BaseObject):
     An LLM extension is a pluggable feature or behavior of an
     :class:`~pipecat.services.llm_service.LLMService`. It can add to the
     service's system instruction, watch the frames the service processes,
-    filter what the service pushes, and push frames of its own. The service
-    runs its extensions in :attr:`order`.
+    filter what the service pushes, and push frames of its own.
+
+    Extensions wrap the service the way middleware wraps a handler: as the
+    layers of an onion, with the service at the center. :attr:`order` places
+    an extension among the layers: lower sits closer to the service. An
+    incoming frame, one the service processes, passes the layers from the
+    outside in. An outgoing frame, one pushed from the service, passes them
+    from the inside out. With extensions A, B and C, A closest to the
+    service::
+
+        incoming:  C.process_frame, B.process_frame, A.process_frame, the service
+        outgoing:  the service, A.filter_push_frame, B.filter_push_frame, C.filter_push_frame
+
+    To an extension, everything inside its layer is "the service": the
+    service itself and the extensions closer to it. So an extension's author
+    needs to know nothing about what else is attached, and has two
+    guarantees:
+
+    - :meth:`filter_push_frame` sees every frame pushed from inside the
+      layer, whether the service pushed it or an extension closer in did.
+    - :meth:`process_frame` sees an incoming frame before
+      :meth:`filter_push_frame` sees anything produced in reaction to it.
+
+    The second guarantee has one limit: the steps every AI service runs come
+    ahead of the extensions. A service starts, stops or cancels on a
+    ``StartFrame``, ``EndFrame`` or ``CancelFrame`` before its extensions see
+    the frame, so a frame it pushes while doing so reaches the filters first.
 
     An extension is attached to a service in its settings
     (``LLMService(settings=...Settings(extensions=[...]))``), later by a
@@ -61,12 +86,13 @@ class BaseLLMExtension(BaseObject):
       the application's prompt;
     - adds the tools :meth:`builtin_tools` returns to its built-in tools,
       synced with the registered tools before each inference;
-    - hands it every frame it processes, in :meth:`process_frame`, before its
-      own handling of the frame;
-    - passes every frame it pushes through :meth:`filter_push_frame`, which can
-      hold the frame back, drop it, or add frames;
-    - pushes the frames the extension pushes with :meth:`push_frame` and
-      :meth:`broadcast_frame` as they are: its extensions don't filter them.
+    - hands it every incoming frame, in :meth:`process_frame`, before the
+      layers inside it handle the frame;
+    - passes every frame pushed from inside its layer through
+      :meth:`filter_push_frame`, which can hold the frame back, drop it, or
+      add frames;
+    - sends the frames it pushes with :meth:`push_frame` and
+      :meth:`broadcast_frame` through the layers outside it, then on.
 
     A service holds one extension of each class, which
     :meth:`~pipecat.services.llm_service.LLMService.get_extension` finds. If a
@@ -80,9 +106,10 @@ class BaseLLMExtension(BaseObject):
     """
 
     order: int = 0
-    """Where the extension runs among a service's extensions, lower first,
-    both in filtering what the service pushes and in composing instructions.
-    Extensions of equal order run in the order they were attached."""
+    """Where the extension sits among the layers around a service: lower is
+    closer to the service. The lowest filters an outgoing frame first and
+    sees an incoming frame last. Instructions compose lowest first. Among
+    extensions of equal order, one attached earlier sits closer."""
 
     def __init__(self, **kwargs):
         """Initialize the extension.
@@ -138,7 +165,12 @@ class BaseLLMExtension(BaseObject):
         return []
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Watch a frame the service processes, before the service handles it.
+        """Watch an incoming frame, before the layers inside handle it.
+
+        The extensions farther from the service have seen the frame; the ones
+        closer to it, and then the service, handle it next. Anything they
+        produce in reaction reaches :meth:`filter_push_frame` after this
+        returns.
 
         Args:
             frame: The frame.
@@ -147,16 +179,17 @@ class BaseLLMExtension(BaseObject):
         pass
 
     async def filter_push_frame(self, frame: Frame, direction: FrameDirection) -> list[Frame]:
-        """Filter a frame the service pushes.
+        """Filter a frame pushed from inside this extension's layer.
 
+        The service pushed the frame, or an extension closer to it did.
         Returns the frames to push in its place, in the same direction:
         ``[frame]`` to pass it on, an empty list to hold it back or drop it, or
         more frames to add some. The frames returned continue through the
-        extensions after this one. A frame for the other direction is pushed
+        extensions farther out. A frame for the other direction is pushed
         with :meth:`push_frame` or :meth:`broadcast_frame`.
 
         Args:
-            frame: The frame the service is pushing.
+            frame: The frame being pushed.
             direction: The direction of frame pushing.
 
         Returns:
@@ -165,7 +198,10 @@ class BaseLLMExtension(BaseObject):
         return [frame]
 
     async def push_frame(self, frame: Frame, direction: FrameDirection = FrameDirection.DOWNSTREAM):
-        """Push a frame from the service, as it is.
+        """Push a frame of the extension's own.
+
+        The frame passes the extensions farther from the service, then
+        leaves the service.
 
         Args:
             frame: The frame to push.
@@ -174,7 +210,10 @@ class BaseLLMExtension(BaseObject):
         await self._call_event_handler("on_push_frame", frame, direction)
 
     async def broadcast_frame(self, frame_cls: type[Frame], **kwargs):
-        """Broadcast a frame from the service, upstream and downstream.
+        """Broadcast a frame of the extension's own, upstream and downstream.
+
+        Each of the two frames passes the extensions farther from the
+        service, then leaves the service.
 
         Args:
             frame_cls: The class of the frame to broadcast.
